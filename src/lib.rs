@@ -1,47 +1,90 @@
+use crate::Limiters::{Price, Quality};
 use crate::Options::{Entry, Exit, Voice};
 use std::mem::swap;
 
-#[derive(Debug)]
-#[derive(PartialEq)]
-enum Options {
+#[derive(Debug, PartialEq)]
+pub enum Options {
     Exit = 0,
     Voice = 1,
     Entry = 2,
 }
 
-// TODO: difference between decline in quality and increase in price/cost of membership
-struct Org {
-    allows: [bool; 2],  // to be accessed using the Options enum
-    cost: [u32; 3],     // to be accessed using the Options enum
-    quality: u32,
+#[derive(Debug, PartialEq)]
+pub enum Limiters {
+    Quality = 0,
+    Price = 1,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Org {
+    pub allows: [bool; 2], // to be accessed using the Options enum
+    pub cost: [u32; 3],    // to be accessed using the Options enum
+    pub quality: u32,
+    pub price: u32,
 }
 
 impl Org {
-    fn is_declining(&self, min_accepted_quality: u32) -> bool {
-        self.quality <= min_accepted_quality
+    pub fn is_declining(&self, limiters: [u32; 2], relevant: &[Limiters; 2]) -> bool {
+        let quality_declining = self.quality < limiters[Quality as usize];
+        let price_declining = self.price > limiters[Price as usize];
+
+        if !relevant.contains(&Price) {
+            quality_declining
+        } else if relevant.contains(&Quality) && relevant.contains(&Price) {
+            quality_declining && price_declining
+        } else {
+            price_declining
+        }
     }
 
-    fn tolerate_decline(&self, min_accepted_quality: u32, tolerance: u32) -> bool {
-        self.quality >= (min_accepted_quality - tolerance)
+    fn tolerate_decline(
+        &self,
+        limiters: [u32; 2],
+        relevant: &[Limiters; 2],
+        tolerance: [u32; 2],
+    ) -> bool {
+        let quality_tolerated =
+            self.quality >= (limiters[Quality as usize] - tolerance[Quality as usize]);
+        let price_tolerated = self.price <= (limiters[Price as usize] - tolerance[Price as usize]);
+
+        if !relevant.contains(&Price) {
+            return quality_tolerated;
+        } else if relevant.contains(&Price) {
+            return quality_tolerated && price_tolerated;
+        }
+        price_tolerated
     }
 
-    fn can_use(&self, max_cost: u32, option: Options) -> bool {
+    fn can_use(
+        &self,
+        max_cost: u32,
+        option: Options,
+        influence: Option<u32>,
+        elastic: Option<bool>,
+        alt_exists: Option<bool>,
+    ) -> bool {
         match option {
-            Exit => self.cost[0] <= max_cost && self.allows[0],
-            Voice => self.cost[1] <= max_cost && self.allows[1],
+            Exit => {
+                self.cost[0] <= max_cost
+                    && self.allows[0]
+                    && (elastic.unwrap() || alt_exists.unwrap())
+            }
+            Voice => self.cost[1] <= max_cost && self.allows[1] && influence.unwrap() > 0,
             Entry => self.cost[2] <= max_cost,
         }
     }
 }
 
-struct Membership {
-    org: Option<Org>,
-    alternatives: Vec<Org>,
-    min_accepted_quality: u32,
-    tolerance: u32,
-    max_cost: [u32; 3],
-    elastic: bool,
-    influence: u32,
+pub struct Membership {
+    pub org: Option<Org>,
+    pub alternatives: Vec<Org>,
+    pub relevant: [Limiters; 2],
+    pub maximize: Limiters,
+    pub limiters: [u32; 2],  // to be accessed using the Limiters enum
+    pub tolerance: [u32; 2], // to be accessed using the Limiters enum
+    pub max_cost: [u32; 3],  // to be accessed using the Options enum
+    pub elastic: bool,
+    pub influence: u32,
 }
 
 impl Membership {
@@ -55,14 +98,14 @@ impl Membership {
             .iter()
             .filter(|a| {
                 a.cost[Entry as usize] <= self.get_max_cost(Entry)
-                    && a.quality >= self.min_accepted_quality
+                    && a.quality >= self.limiters[Quality as usize]
             })
             .min_by_key(|a| a.cost[Entry as usize])
     }
 }
 
-struct Member {
-    org_vec: Vec<Membership>,
+pub struct Member {
+    pub org_vec: Vec<Membership>,
 }
 
 impl Member {
@@ -95,30 +138,30 @@ impl Member {
         }
     }
 
-    fn decision_making(m: &mut Membership) -> Option<Options> {
+    pub fn decision_making(m: &mut Membership) -> Option<Options> {
         if let Some(org) = &m.org {
-            let can_use_exit = org.can_use(m.get_max_cost(Exit), Exit);
-            let decline_tolerated = org.tolerate_decline(m.min_accepted_quality, m.tolerance);
+            let decline_tolerated = org.tolerate_decline(m.limiters, &m.relevant, m.tolerance);
 
             // if the quality of an organization is below the minimum accepted quality...
-            if org.is_declining(m.min_accepted_quality) {
+            if org.is_declining(m.limiters, &m.relevant) {
                 let alt_exists = m.get_best_alt().is_some();
+                let can_use_exit = org.can_use(
+                    m.get_max_cost(Exit),
+                    Exit,
+                    None,
+                    Some(m.elastic),
+                    Some(alt_exists),
+                );
 
-                // TODO: move considerations of elasticity and availability of alternatives to
-                //  can_use_exit and move considerations of influence to can_use_voice
-                if org.can_use(m.get_max_cost(Voice), Voice) {  // and voice can be used
-                    if (!can_use_exit                           // and exit cannot
-                        || decline_tolerated                    // or the decline is tolerable
-                        || (!m.elastic && !alt_exists))         // or demand is inelastic and no
-                                                                // acceptable alternative exists
-                        && m.influence > 0                      // and influence is not null
-                    {
-                        Member::voice(m);                       // voice will be used
+                // ...and voice can be used...
+                if org.can_use(m.get_max_cost(Voice), Voice, Some(m.influence), None, None) {
+                    // if exit cannot be used or decline is tolerable
+                    if !can_use_exit || decline_tolerated {
+                        Member::voice(m); // voice will be used
                         return Some(Voice);
                     }
-                } else if can_use_exit && !decline_tolerated && (m.elastic || alt_exists) {
-                    // else, if exit can be used and decline is not tolerable and demand is either
-                    // elastic or an alternative exists, exit will be used
+                } else if can_use_exit && !decline_tolerated {
+                    // else, if exit can be used and decline is not tolerable, exit will be used
                     Member::exit(m);
                     return Some(Exit);
                 }
@@ -128,185 +171,9 @@ impl Member {
         None
     }
 
-    fn check(&mut self) {
+    pub fn check(&mut self) {
         for m in self.org_vec.iter_mut() {
             Member::decision_making(m);
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_decline() {
-        let mut m = Membership {
-            org: Some(Org {
-                allows: [true, true],   // exit and voice are allowed
-                cost: [0, 0, 0],
-                quality: 2,
-            }),
-            alternatives: vec![Org {    // an equally good alternative exists
-                allows: [true, true],
-                cost: [0, 0, 0],
-                quality: 2,
-            }],                         // for both organizations:
-            min_accepted_quality: 1,    // the quality is acceptable
-            tolerance: 0,               // ibid
-            max_cost: [1, 1, 1],        // exit, voice, and entry to the alternative are viable
-            elastic: true,              // the demand is elastic and therefore exit can be used
-                                        // even without a viable alternative
-            influence: 1,
-        };
-
-        // since the organization is not declining, no action should be taken
-        assert_eq!(Member::decision_making(&mut m), None)
-    }
-
-    #[test]
-    fn declining_monopoly_1() {
-        let mut m = Membership {
-            org: Some(Org {
-                allows: [false, false], // exit and voice are not allowed
-                cost: [0, 0, 0],
-                quality: 1,
-            }),
-            alternatives: vec![Org {    // a better alternative exists
-                allows: [true, true],
-                cost: [0, 0, 0],
-                quality: 2,
-            }],
-            min_accepted_quality: 2,    // the organization is declining
-            tolerance: 0,               // ibid
-            max_cost: [1, 1, 1],
-            elastic: true,
-            influence: 1,
-        };
-
-        // since the organization does not allow neither exit nor voice, no action should be taken
-        assert_eq!(Member::decision_making(&mut m), None)
-    }
-
-    #[test]
-    fn declining_monopoly_2() {
-        let mut m = Membership {
-            org: Some(Org {
-                allows: [true, false],  // only exit is allowed
-                cost: [0, 0, 0],
-                quality: 1,
-            }),
-            alternatives: vec![],       // no alternatives exist
-            min_accepted_quality: 2,    // the organization is declining
-            tolerance: 0,               // ibid
-            max_cost: [1, 1, 1],        // exit is viable
-            elastic: false,             // the demand is inelastic and therefore exit cannot be used
-                                        // without a viable alternative
-            influence: 0,
-        };
-
-        // since demand is inelastic and no alternatives exist, no action will be taken
-        assert_eq!(Member::decision_making(&mut m), None)
-    }
-
-    #[test]
-    fn declining_monopoly_3() {
-        let mut m = Membership {
-            org: Some(Org {
-                allows: [true, true],   // exit and voice are allowed
-                cost: [2, 2, 0],
-                quality: 1,
-            }),
-            alternatives: vec![Org {    // a better alternative exists
-                allows: [true, true],
-                cost: [0, 0, 0],
-                quality: 2,
-            }],
-            min_accepted_quality: 2,    // the organization is declining
-            tolerance: 0,               // ibid
-            max_cost: [1, 1, 1],        // exit and voice are too expensive
-            elastic: true,
-            influence: 1,
-        };
-
-        // since exit and voice are too expensive, no action should be taken
-        assert_eq!(Member::decision_making(&mut m), None)
-    }
-
-    #[test]
-    fn declining_monopoly_4() {
-        let mut m = Membership {
-            org: Some(Org {
-                allows: [true, false],  // only exit is allowed
-                cost: [1, 1, 1],
-                quality: 1,
-            }),
-            alternatives: vec![Org {    // a better alternative exists
-                allows: [true, true],
-                cost: [0, 0, 3],
-                quality: 2,
-            }],
-            min_accepted_quality: 2,    // the organization is declining
-            tolerance: 0,               // ibid
-            max_cost: [2, 2, 2],        // exit and voice are viable but entry to the alternative
-                                        // isn't
-            elastic: false,             // the demand is inelastic
-            influence: 0,
-        };
-
-        // since demand is inelastic and entry to the only existing alternative is too expensive,
-        // no action should be taken
-        assert_eq!(Member::decision_making(&mut m), None)
-    }
-
-    #[test]
-    fn declining_monopoly_5() {
-        let mut m = Membership {
-            org: Some(Org {
-                allows: [true, false],  // only exit is allowed
-                cost: [1, 1, 1],
-                quality: 1,
-            }),
-            alternatives: vec![Org {    // an equally bad alternative exists
-                allows: [true, true],
-                cost: [0, 0, 0],
-                quality: 1,
-            }],
-            min_accepted_quality: 2,    // the organization is declining
-            tolerance: 0,               // ibid
-            max_cost: [2, 2, 2],        // exit and voice are viable
-            // isn't
-            elastic: false,             // the demand is inelastic
-            influence: 0,
-        };
-
-        // since demand is inelastic and entry to the only existing alternative is not acceptable,
-        // no action should be taken
-        assert_eq!(Member::decision_making(&mut m), None)
-    }
-
-    #[test]
-    fn declining_monopoly_6() {
-        let mut m = Membership {
-            org: Some(Org {
-                allows: [false, true],  // only voice is allowed
-                cost: [0, 0, 0],
-                quality: 1,
-            }),
-            alternatives: vec![],
-            min_accepted_quality: 2,    // the organization is declining
-            tolerance: 0,               // ibid
-            max_cost: [1, 1, 1],        // voice is viable
-            elastic: true,
-            influence: 0,               // influence is null
-        };
-
-        // since exit is not allowed influence is perceived to be null, no action should be taken
-        assert_eq!(Member::decision_making(&mut m), None)
-    }
-
-    // TODO: write tests for monopolies that can recover through the use of voice, exit with elastic
-    //  demand, exit with inelastic demand and a good alternative, exit with inelastic demand
-    //  and several good alternatives, and exit with inelastic demand with alternatives of varying
-    //  quality
 }
